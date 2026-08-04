@@ -63,8 +63,11 @@ SPECIAL_LABEL_WORDS = (
 #: Строка расчёта среднего в mtools.
 MEAN_LINE = '"Среднее"=m'
 
-#: Отступ строк блока ответов.
-INDENT = "\t"
+#: Отступ строк блока ответов (mtools ждёт альтернативы без табуляции).
+INDENT = ""
+
+#: Префиксы служебных переменных, которые не попадают в выгрузку.
+SERVICE_PREFIXES = ("sys_",)
 
 #: Кодировки, которые перебираются при чтении .sav.
 FALLBACK_ENCODINGS = ("cp1251", "utf-8", "cp1252", "koi8-r")
@@ -86,8 +89,10 @@ RE_RC = re.compile(r"^(?P<base>.+?)_r(?P<row>\d+)_c(?P<col>\d+)$", re.IGNORECASE
 # Хвостовой числовой суффикс: QA6xr2_5 -> база QA6xr2
 RE_MULTI = re.compile(r"^(?P<base>.+?)_(?P<idx>\d+)$")
 
-# Грид-строки в финальном (нормализованном) виде
+# <ПЕРЕМЕННАЯ>_r<ПОЗИЦИЯ> -> <ПЕРЕМЕННАЯ>xr<ПОЗИЦИЯ>
 RE_GRID_R = re.compile(r"^(?P<base>.+?)_r(?P<row>\d+)$", re.IGNORECASE)
+
+# Грид-строки в финальном (нормализованном) виде
 RE_GRID_XR = re.compile(r"^(?P<base>.+?)xr(?P<row>\d+)$", re.IGNORECASE)
 
 # Строка, целиком состоящая из числа ("00123", "12,5", "-7")
@@ -155,6 +160,26 @@ def name_index(name: str) -> str:
 def strip_q(name: str) -> str:
     """Отсекает техническую букву Q в начале базы вопроса."""
     return re.sub(r"^[Qq]", "", name)
+
+
+def canon_grid_name(name: str) -> str:
+    """QA1_r1 -> QA1xr1 (единый вид строк грида для mtools)."""
+    m = RE_GRID_R.match(name)
+    if m:
+        return "%sxr%s" % (m.group("base"), int(m.group("row")))
+    return name
+
+
+def smt_stem(base: str) -> str:
+    """Имя справочника без лишних точек: QC6.1 -> QC6."""
+    stem = base.split(".")[0].strip()
+    return stem or base
+
+
+def is_service(name: str) -> bool:
+    """Служебная переменная выгрузки (sys_...)."""
+    low = name.lower()
+    return any(low.startswith(prefix) for prefix in SERVICE_PREFIXES)
 
 
 def is_special(code, label: str) -> bool:
@@ -251,20 +276,26 @@ def read_sav(path: str, encoding: Optional[str], user_missing: bool):
     raise RuntimeError(f"Не удалось прочитать {path}: {last_error}")
 
 
-def collect_variables(df, meta) -> Tuple[List[VarInfo], int, int]:
+def collect_variables(df, meta) -> Tuple[List[VarInfo], int, int, int]:
     """Предварительная фильтрация переменных.
 
-    Отбрасывает полностью пустые переменные и текстовые переменные, кроме тех,
-    что заполнены исключительно числами (они трактуются как числовые).
+    Отбрасывает служебные переменные (sys_...), полностью пустые переменные и
+    текстовые переменные, кроме тех, что заполнены исключительно числами
+    (они трактуются как числовые).
     """
     variables: List[VarInfo] = []
     dropped_empty = 0
     dropped_string = 0
+    dropped_service = 0
 
     types = getattr(meta, "readstat_variable_types", {}) or {}
     labels_by_name = dict(zip(meta.column_names, meta.column_labels or []))
 
     for name in meta.column_names:
+        if is_service(name):
+            dropped_service += 1
+            continue
+
         column = df[name].tolist() if name in df else []
         is_string = types.get(name) == "string"
 
@@ -307,7 +338,7 @@ def collect_variables(df, meta) -> Tuple[List[VarInfo], int, int]:
             )
         )
 
-    return variables, dropped_empty, dropped_string
+    return variables, dropped_empty, dropped_string, dropped_service
 
 
 # ---------------------------------------------------------------------------
@@ -353,15 +384,15 @@ def group_entries(variables: Sequence[VarInfo]) -> List[Entry]:
         var = members[0]
         name = var.norm
         if var.is_complex:
-            # Комплексное имя без пары — не мульти, откатываем к BASE_rN.
+            # Комплексное имя без пары — не мульти, откатываем к одиночной
+            # строке грида BASE_rN (ниже она канонизируется в BASExrN).
             name = "%s_r%d" % (var.cbase, var.crow)
-        entry = Entry(name=name, members=members)
-        if len(members) > 1:
-            entry.members = members
-        entries.append(entry)
+        entries.append(Entry(name=name, members=members))
 
     for entry in entries:
-        m = RE_GRID_R.match(entry.name) or RE_GRID_XR.match(entry.name)
+        # <ПЕРЕМЕННАЯ>_r<ПОЗИЦИЯ> -> <ПЕРЕМЕННАЯ>xr<ПОЗИЦИЯ>
+        entry.name = canon_grid_name(entry.name)
+        m = RE_GRID_XR.match(entry.name)
         if m:
             entry.grid_base = m.group("base")
             entry.grid_row = int(m.group("row"))
@@ -428,6 +459,22 @@ def common_label(labels: Sequence[str]) -> str:
     return " - ".join(first[:-1]) if len(first) > 1 else labels[0]
 
 
+def drop_leading_index(text: str, qnum: str) -> str:
+    """Убирает дублирующийся номер вопроса в начале текста метки.
+
+    Индекс строки генерируется скриптом, поэтому «A1.1. A1. В среднем...»
+    схлопывается в «A1.1. В среднем...».
+    """
+    if not qnum or not text:
+        return text
+    pattern = r"^[Qq]?%s(?:\.\d+)*(?![0-9A-Za-zА-Яа-яЁё])\s*[\.\):-]*\s*" % re.escape(qnum)
+    m = re.match(pattern, text)
+    if not m or m.end() == 0:
+        return text
+    rest = text[m.end():].strip()
+    return rest or text
+
+
 def build_title(entry: Entry) -> str:
     """Формирует заголовок записи по правилам mtools."""
     strip_names = [entry.name]
@@ -450,11 +497,8 @@ def build_title(entry: Entry) -> str:
 
     if entry.grid_base:
         # Для гридов индекс строки генерируется всегда: B7.1. Хумира
-        text = last_segment(label)
-        if not text:
-            text = label
-        if text.startswith(index):
-            return text
+        text = last_segment(label) or label
+        text = drop_leading_index(text, strip_q(entry.grid_base))
         return "%s. %s" % (index, text) if text else index
 
     if not label:
@@ -462,8 +506,9 @@ def build_title(entry: Entry) -> str:
 
     # Защита одиночек: если метка начиналась с собственного имени переменной,
     # индекс принудительно возвращается обратно в человеческом виде.
-    if had_prefix and not re.match(r"^%s[\.\s]" % re.escape(index), label):
-        return "%s. %s" % (index, label)
+    if had_prefix:
+        text = drop_leading_index(label, re.sub(r"\.\d+$", "", index))
+        return "%s. %s" % (index, text) if text else index
     return label
 
 
@@ -549,6 +594,17 @@ def grid_mode(entries: Sequence[Entry], categorical: set) -> str:
 # ---------------------------------------------------------------------------
 
 
+def unique_smt_name(base: str, taken) -> str:
+    """Имя .smt без лишних точек и без коллизий: QC6.1 -> QC6.smt."""
+    stem = smt_stem(base)
+    name = "%s.smt" % stem
+    suffix = 2
+    while name in taken:
+        name = "%s_%d.smt" % (stem, suffix)
+        suffix += 1
+    return name
+
+
 def build_output(entries: List[Entry], categorical: set) -> "OrderedDict[str, List[str]]":
     """Заполняет блоки ответов и формирует содержимое .smt файлов."""
     smt_files: "OrderedDict[str, List[str]]" = OrderedDict()
@@ -575,7 +631,7 @@ def build_output(entries: List[Entry], categorical: set) -> "OrderedDict[str, Li
         for row in rows:
             labels.update(row.labels)
             values.extend(row.values)
-        smt_name = "%s.smt" % base
+        smt_name = unique_smt_name(base, smt_files)
         smt_files[smt_name] = build_lines(mode, labels, values)
         for row in rows:
             row.include = smt_name
@@ -590,11 +646,7 @@ def build_output(entries: List[Entry], categorical: set) -> "OrderedDict[str, Li
     for lines, group in buckets.items():
         if len(group) < 2:
             continue
-        smt_name = "%s.smt" % group[0].name
-        suffix = 2
-        while smt_name in smt_files:
-            smt_name = "%s_%d.smt" % (group[0].name, suffix)
-            suffix += 1
+        smt_name = unique_smt_name(group[0].name, smt_files)
         smt_files[smt_name] = list(lines)
         for entry in group:
             entry.include = smt_name
@@ -605,11 +657,12 @@ def build_output(entries: List[Entry], categorical: set) -> "OrderedDict[str, Li
 def render_adl(entries: Sequence[Entry], def_name: str) -> List[str]:
     out: List[str] = ["include %s.def" % def_name, ""]
     for entry in entries:
-        out.append('["%s" where=%s]' % (esc_label(entry.title), entry.name))
+        out.append('["%s" where=%s' % (esc_label(entry.title), entry.name))
         if entry.include:
-            out.append("%sinclude %s" % (INDENT, entry.include))
+            out.append("include %s" % entry.include)
         else:
             out.extend(entry.lines)
+        out.append("]")
         out.append("")
     return out
 
@@ -660,7 +713,7 @@ def convert(
     categorical = set(CATEGORICAL_GRID_BASES) | set(categorical or ())
 
     df, meta = read_sav(sav_path, in_encoding, user_missing)
-    variables, dropped_empty, dropped_string = collect_variables(df, meta)
+    variables, dropped_empty, dropped_string, dropped_service = collect_variables(df, meta)
     if not variables:
         sys.exit("В файле не осталось переменных после фильтрации.")
 
@@ -680,8 +733,9 @@ def convert(
 
     if not quiet:
         print("Прочитано переменных: %d" % len(meta.column_names))
-        print("  исключено пустых:   %d" % dropped_empty)
-        print("  исключено строковых:%d" % dropped_string)
+        print("  исключено пустых:    %d" % dropped_empty)
+        print("  исключено строковых: %d" % dropped_string)
+        print("  исключено служебных: %d" % dropped_service)
         print("Записей в структуре:  %d" % len(entries))
         print("Файл структуры:       %s" % adl_path)
         for smt_name in smt_files:

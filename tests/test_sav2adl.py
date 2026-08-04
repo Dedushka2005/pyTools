@@ -38,40 +38,59 @@ def test_all():
         assert head[0] == "include sample.def", head[0]
         assert head[1] == "", head[:3]
 
-        # 2. Фильтрация: пустая и текстовая переменные исключены,
+        # 1.1 Формат блока: "]" после всех альтернатив, без табуляции
+        assert (
+            '["S5.1. Ревматоидный артрит" where=QS5x1\n'
+            '"Да"=1\n'
+            '"Нет"=2\n'
+            "]"
+        ) in adl
+        assert "\t" not in adl
+
+        # 2. Фильтрация: пустая, текстовая и служебная переменные исключены,
         #    текстовая из одних цифр сохранена как числовая
-        assert "where=QA2]" not in adl
-        assert "where=QA3]" not in adl
-        assert "where=QA4]" in adl
+        assert "where=QA2" not in adl
+        assert "where=QA3" not in adl
+        assert "sys_" not in adl
+        assert "where=QA4" in adl
 
         # 3. Нормализация имён и схлопывание множественного выбора
         assert '"A6.1. Строка 1" where=QA6xr1' in adl      # QA6_5.1/QA6_6.1
         assert '"A6.2. Строка 2" where=QA6xr2' in adl      # QA6_5.2/QA6_6.2
         assert '"A12.8. Строка 8" where=QA12xr8' in adl    # QA12_r8_c1/_c2
-        assert "where=QA6_5.2]" not in adl
-        assert "where=QA12_r8_c1]" not in adl
+        assert "where=QA6_5.2" not in adl
+        assert "where=QA12_r8_c1" not in adl
 
-        # 3.1 Одиночный грид: QA8_r1_c1 -> откат к QA8_r1, не мульти
-        assert "where=QA8_r1]" in adl
-        assert "QA8xr1" not in adl
+        # 3.1 Строки грида всегда в виде <ПЕРЕМЕННАЯ>xr<ПОЗИЦИЯ>
+        assert "where=QB7xr1" in adl and "where=QB7_r1" not in adl
+        # одиночный грид QA8_r1_c1 не стал блоком множественного выбора
+        assert "where=QA8xr1" in adl
+        assert "QA8xr1_" not in adl
 
         # 4. Заголовки
         assert '"A1. В среднем сколько лет пациенту?"' in adl   # индекс сохранён
         assert '"B7.1. Хумира (адалимумаб)"' in adl             # индекс грида, Q отсечена
         assert '"S5.1. Ревматоидный артрит" where=QS5x1' in adl  # защита одиночек
 
+        # 4.1 Дублирующийся номер вопроса убирается: не «A7.1. A7. В среднем...»
+        assert (
+            '"A7.1. В среднем, сколько пациентов Вы наблюдаете в течение года?'
+            ' 1 Ревматоидный артрит" where=QA7xr1'
+        ) in adl
+        assert "A7.1. A7." not in adl
+
         # 5.1 Открытый числовой вопрос без меток
-        assert '\t"18"=18 value=18' in adl
-        assert '\t"25"=25 value=25' in adl
+        assert '\n"18"=18 value=18' in adl
+        assert '\n"25"=25 value=25' in adl
 
         # 5.2 Множественный выбор — чистый формат, без value= и без среднего
-        multi = adl.split('"A12.8. Строка 8" where=QA12xr8]')[1].split("\n\n")[0]
+        multi = adl.split('"A12.8. Строка 8" where=QA12xr8')[1].split("\n]")[0]
         assert '"Интернет"=1' in multi
         assert "value=" not in multi and "Среднее" not in multi
 
-        # 6.1 Общий include для гридов
-        for row in ("QB7_r1", "QB7_r2", "QB7_r3"):
-            assert 'where=%s]\n\tinclude QB7.smt' % row in adl
+        # 6.1 Общий include для гридов, без табуляции
+        for row in ("QB7xr1", "QB7xr2", "QB7xr3"):
+            assert "where=%s\ninclude QB7.smt\n]" % row in adl
         assert "QB7.smt" in files
 
         # 6.2 Сортировка внутри .smt: шкала, спецкоды, среднее
@@ -92,8 +111,12 @@ def test_all():
         assert qb3 == ['"Каждый день"=1', '"Раз в неделю"=2', '"Реже"=3'], qb3
 
         # 6.4 Дубликаты у одиночных переменных вынесены в общий .smt
-        assert 'where=QD1]\n\tinclude QD1.smt' in adl
-        assert 'where=QD2]\n\tinclude QD1.smt' in adl
+        assert "where=QD1\ninclude QD1.smt\n]" in adl
+        assert "where=QD2\ninclude QD1.smt\n]" in adl
+
+        # 6.5 В имени справочника остаётся одна точка — перед расширением
+        assert "QC6.smt" in files and "QC6.1.smt" not in files
+        assert "include QC6.smt" in adl
 
         print("OK: все проверки пройдены")
 
