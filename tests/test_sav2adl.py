@@ -79,6 +79,17 @@ def test_all():
         ) in adl
         assert "A7.1. A7." not in adl
 
+        # 4.2 Тот же дубль, но номер в метке набран кириллицей («В1.» при QB1)
+        assert (
+            '"B1. Какие препараты для лечения ревматоидного артрита'
+            ' Вы назначаете?" where=QB1'
+        ) in adl
+        assert (
+            '"B2.1. Оцените препараты по эффективности 1 Хумира" where=QB2xr1'
+        ) in adl
+        for dup in ("B1. В1.", "B2.1. В2.", "B1. B1.", "B2.1. B2."):
+            assert dup not in adl, dup
+
         # 5.1 Открытый числовой вопрос без меток
         assert '\n"18"=18 value=18' in adl
         assert '\n"25"=25 value=25' in adl

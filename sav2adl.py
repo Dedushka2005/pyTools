@@ -60,6 +60,16 @@ SPECIAL_LABEL_WORDS = (
     "другой",
 )
 
+#: Кириллические буквы, визуально неотличимые от латинских. Номера вопросов в
+#: метках SPSS часто набраны кириллицей («В1.» вместо «B1.»), тогда как имена
+#: переменных всегда латиницей, — при сравнении обе стороны приводятся к латинице.
+CYRILLIC_LOOKALIKES = {
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H",
+    "О": "O", "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X",
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+}
+LOOKALIKE_TABLE = str.maketrans(CYRILLIC_LOOKALIKES)
+
 #: Строка расчёта среднего в mtools.
 MEAN_LINE = '"Среднее"=m'
 
@@ -459,16 +469,27 @@ def common_label(labels: Sequence[str]) -> str:
     return " - ".join(first[:-1]) if len(first) > 1 else labels[0]
 
 
+def fold_lookalikes(text: str) -> str:
+    """Приводит кириллические буквы-двойники к латинице (В1. -> B1.)."""
+    return text.translate(LOOKALIKE_TABLE)
+
+
 def drop_leading_index(text: str, qnum: str) -> str:
     """Убирает дублирующийся номер вопроса в начале текста метки.
 
-    Индекс строки генерируется скриптом, поэтому «A1.1. A1. В среднем...»
-    схлопывается в «A1.1. В среднем...».
+    Индекс генерируется скриптом из имени переменной, поэтому
+    «A1.1. A1. В среднем...» схлопывается в «A1.1. В среднем...», а
+    «B1. В1. Какие препараты...» — в «B1. Какие препараты...» (номер в метке
+    набран кириллицей).
     """
     if not qnum or not text:
         return text
-    pattern = r"^[Qq]?%s(?:\.\d+)*(?![0-9A-Za-zА-Яа-яЁё])\s*[\.\):-]*\s*" % re.escape(qnum)
-    m = re.match(pattern, text)
+    pattern = r"^[Qq]?%s(?:\.\d+)*(?![0-9A-Za-zА-Яа-яЁё])\s*[\.\):-]*\s*" % re.escape(
+        fold_lookalikes(qnum)
+    )
+    # Замена двойников не меняет длину строки, поэтому позиции совпадают
+    # с исходным текстом и его можно резать по m.end().
+    m = re.match(pattern, fold_lookalikes(text), flags=re.IGNORECASE)
     if not m or m.end() == 0:
         return text
     rest = text[m.end():].strip()
