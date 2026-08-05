@@ -196,9 +196,10 @@ def test_response_validation():
 
     responses = design[["respondent_id", "task_id", "concept_id"]].copy()
     responses["chosen"] = (responses["concept_id"] == 1).astype(int)
-    x, y, respondents, _ = estimator._prepare(design, responses)
+    x, response, respondents, _ = estimator._prepare(design, responses)
     assert x.shape == (2, 4, 3, estimator.coder.n_params)
-    assert y.shape == (2, 4) and (y == 0).all()
+    assert response.shape == (2, 4, 3)
+    assert (response[..., 0] == 1).all() and (response[..., 1:] == 0).all()
     assert list(respondents) == [1, 2]
 
     # два выбора в одной задаче — режим single_choice нарушен
@@ -211,6 +212,96 @@ def test_response_validation():
         print("ok: нарушение режима single_choice отвергается")
         return
     raise AssertionError("ожидалось ValueError при двух выборах в одной задаче")
+
+
+def test_response_column_is_one_schema():
+    # response / chosen / allocation — синонимы одной колонки, а не три формата
+    frame = pd.DataFrame({"respondent_id": [1], "task_id": [1], "concept_id": [1]})
+    for name in ("response", "chosen", "allocation"):
+        candidate = frame.copy()
+        candidate[name] = 1
+        assert CBCHierarchicalBayesEstimator.resolve_response_column(candidate) == name
+    try:
+        CBCHierarchicalBayesEstimator.resolve_response_column(frame)
+    except KeyError as exc:
+        assert "нет колонки с ответом" in str(exc)
+        print("ok: колонка ответа распознаётся по единой схеме")
+        return
+    raise AssertionError("ожидался KeyError при отсутствии колонки ответа")
+
+
+def test_allocation_validation():
+    generator = make_generator(num_respondents=2, tasks_per_respondent=4)
+    design = generator.generate()
+    estimator = CBCHierarchicalBayesEstimator(
+        list(SPACE), interactions=[PAIR], response_mode="allocation"
+    )
+    estimator.coder.fit(design)
+
+    responses = design[["respondent_id", "task_id", "concept_id"]].copy()
+    responses["allocation"] = [50.0, 30.0, 20.0] * (len(design) // 3)
+    x, response, _, _ = estimator._prepare(design, responses)
+    assert response.shape == (2, 4, 3)
+    assert np.allclose(response.sum(axis=-1), 100.0)
+    assert estimator.allocation_total == 100.0
+
+    # сумма не равна заявленной — режим allocation нарушен
+    broken = responses.copy()
+    broken.loc[0, "allocation"] = 10.0
+    estimator.allocation_total = 100.0
+    try:
+        estimator._prepare(design, broken)
+    except ValueError as exc:
+        assert "сумма по задаче" in str(exc)
+        print("ok: нарушение суммы баллов в режиме allocation отвергается")
+        return
+    raise AssertionError("ожидалось ValueError при неверной сумме баллов")
+
+
+def test_none_concept_coding():
+    coder = EffectsCoder(list(SPACE), interactions=[PAIR], include_none=True).fit(SPACE)
+    # колонка None стоит между главными эффектами и взаимодействиями
+    assert coder.coded_columns_[coder.n_main] == "None"
+    assert coder.n_structural == coder.n_main + 1
+    assert coder.none_index_ == coder.n_main
+    assert coder.n_params == coder.n_main + 1 + coder.n_interaction
+
+    df = pd.DataFrame(
+        {
+            "Brand": ["Alpha", None],
+            "Price": [299, None],
+            "Storage": ["128GB", None],
+            "is_none": [0, 1],
+        }
+    )
+    x = coder.transform(df)
+    # у None-концепта обнулены и главные эффекты, и взаимодействия
+    assert x[1, coder.n_main] == 1.0
+    assert not x[1, : coder.n_main].any()
+    assert not x[1, coder.n_structural :].any()
+    # у обычного профиля колонка None равна нулю
+    assert x[0, coder.n_main] == 0.0
+    assert x[0, : coder.n_main].any()
+
+    # колонка None исключена из расчёта D-эффективности
+    assert coder.n_main not in coder.design_column_indices_.tolist()
+    assert len(coder.design_column_indices_) == coder.n_main + coder.n_interaction
+    print("ok: None-концепт кодируется отдельной константой альтернативы")
+
+
+def test_none_concept_design():
+    generator = make_generator(include_none=True, num_respondents=3, tasks_per_respondent=6)
+    design = generator.generate()
+    per_task = design.groupby(["respondent_id", "task_id"]).size()
+    assert (per_task == 4).all(), "3 реальных профиля плюс None"
+    assert (design.groupby(["respondent_id", "task_id"])["is_none"].sum() == 1).all()
+
+    # None не ломает ни запреты, ни баланс уровней
+    assert generator.check_prohibitions() == {}
+    balance = generator.balance_report()
+    assert balance["count"].sum() == (design["is_none"] == 0).sum() * len(SPACE)
+    assert 0.0 < generator.d_efficiency_ <= 1.0
+    print("ok: None-концепт добавлен в каждую задачу и исключён из отчётов")
 
 
 def test_unbalanced_tasks_rejected():
@@ -254,6 +345,10 @@ def test_all():
     test_d_efficiency_degenerate_design()
     test_sparsity_report_counts_empty_cells()
     test_response_validation()
+    test_response_column_is_one_schema()
+    test_allocation_validation()
+    test_none_concept_coding()
+    test_none_concept_design()
     test_unbalanced_tasks_rejected()
     test_unknown_level_rejected()
 

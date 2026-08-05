@@ -3,4 +3,4 @@ __pycache__/
 tests/sample.sav
 *.adl
 *.smt
-cbc_hb_trace.png
+cbc_hb_trace*.png

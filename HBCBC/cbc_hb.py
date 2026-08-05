@@ -43,6 +43,14 @@ __all__ = [
 
 ID_COLUMNS = ("respondent_id", "task_id", "concept_id")
 
+#: Колонка-признак None-концепта («не выбрал бы ничего») в плане опроса.
+NONE_COLUMN = "is_none"
+#: Имя индивидуального параметра None-концепта.
+NONE_PARAM = "None"
+
+#: Колонки, в которых может лежать ответ респондента, в порядке приоритета.
+RESPONSE_COLUMNS = ("response", "chosen", "allocation")
+
 
 def _sort_levels(values: Iterable[Any]) -> list[Any]:
     """Детерминированный порядок уровней.
@@ -85,13 +93,26 @@ class EffectsCoder:
         Пары атрибутов, для которых добавляются эффекты взаимодействия первого
         порядка. Для пары (A, B) добавляется (K_a - 1) * (K_b - 1) колонок,
         равных построчным произведениям колонок главных эффектов.
+    include_none
+        Добавить колонку None-концепта. Строки плана с ``is_none == 1`` не имеют
+        атрибутов: все колонки главных эффектов и взаимодействий у них равны
+        нулю, а единица стоит в колонке None. Соответствующий параметр — это
+        индивидуальная константа альтернативы (ASC), она не принадлежит ни
+        одному атрибуту и потому не участвует ни в ограничении нулевой суммы,
+        ни в расчёте важности.
+
+    Порядок колонок кодирования: главные эффекты, затем None, затем
+    взаимодействия. Такой порядок делает блок «не-взаимодействий» непрерывным,
+    что нужно для блочной структуры ковариации верхнего уровня.
     """
 
     def __init__(
         self,
         attribute_cols: Sequence[str],
         interactions: Sequence[tuple[str, str]] | None = None,
+        include_none: bool = False,
     ) -> None:
+        self.include_none = bool(include_none)
         self.attribute_cols = list(attribute_cols)
         if not self.attribute_cols:
             raise ValueError("attribute_cols не может быть пустым")
@@ -120,6 +141,7 @@ class EffectsCoder:
         self.reference_levels_: dict[str, Any] | None = None
         self.basis_: dict[str, np.ndarray] = {}
         self.main_columns_: list[str] = []
+        self.none_columns_: list[str] = []
         self.interaction_columns_: list[str] = []
         self.coded_columns_: list[str] = []
         self.utility_columns_: list[str] = []
@@ -152,13 +174,16 @@ class EffectsCoder:
         self.main_columns_ = [
             f"{attr}={lvl}" for attr in self.attribute_cols for lvl in levels[attr][:-1]
         ]
+        self.none_columns_ = [NONE_PARAM] if self.include_none else []
         self.interaction_columns_ = [
             f"{a}={la} x {b}={lb}"
             for a, b in self.interactions
             for la in levels[a][:-1]
             for lb in levels[b][:-1]
         ]
-        self.coded_columns_ = self.main_columns_ + self.interaction_columns_
+        self.coded_columns_ = (
+            self.main_columns_ + self.none_columns_ + self.interaction_columns_
+        )
         self.utility_columns_ = [
             f"{attr}={lvl}" for attr in self.attribute_cols for lvl in levels[attr]
         ]
@@ -180,6 +205,12 @@ class EffectsCoder:
         return len(self.main_columns_)
 
     @property
+    def n_none(self) -> int:
+        """Число колонок None-концепта (0 или 1)."""
+        self._check_fitted()
+        return len(self.none_columns_)
+
+    @property
     def n_interaction(self) -> int:
         """Число колонок взаимодействий."""
         self._check_fitted()
@@ -189,6 +220,33 @@ class EffectsCoder:
     def n_params(self) -> int:
         self._check_fitted()
         return len(self.coded_columns_)
+
+    @property
+    def n_structural(self) -> int:
+        """Размер блока «не-взаимодействий»: главные эффекты плюс None.
+
+        Именно этот блок получает полную LKJ-ковариацию в режиме ``block_lkj``.
+        """
+        return self.n_main + self.n_none
+
+    @property
+    def none_index_(self) -> int | None:
+        """Позиция колонки None-концепта в закодированном пространстве."""
+        self._check_fitted()
+        return self.n_main if self.include_none else None
+
+    @property
+    def design_column_indices_(self) -> np.ndarray:
+        """Индексы колонок, участвующих в оценке D-эффективности плана.
+
+        Колонка None исключается: она равна единице ровно в одной альтернативе
+        каждой задачи по построению, её среднее не равно нулю, и включение её в
+        расчёт нарушило бы блочно-диагональную структуру ортогонального идеала.
+        """
+        self._check_fitted()
+        keep = list(range(self.n_main))
+        keep += list(range(self.n_structural, self.n_params))
+        return np.array(keep, dtype=int)
 
     @property
     def coded_slices_(self) -> dict[str, slice]:
@@ -207,7 +265,7 @@ class EffectsCoder:
         """Срезы интеракционных колонок в закодированном пространстве."""
         self._check_fitted()
         out: dict[tuple[str, str], slice] = {}
-        start = self.n_main
+        start = self.n_structural
         for a, b in self.interactions:
             width = (len(self.levels_[a]) - 1) * (len(self.levels_[b]) - 1)
             out[(a, b)] = slice(start, start + width)
@@ -228,30 +286,53 @@ class EffectsCoder:
 
     # ------------------------------------------------------------ transform
 
+    def none_mask(self, df: pd.DataFrame) -> np.ndarray:
+        """Булев признак строк None-концепта."""
+        self._check_fitted()
+        if not self.include_none or NONE_COLUMN not in df.columns:
+            return np.zeros(len(df), dtype=bool)
+        return df[NONE_COLUMN].fillna(0).to_numpy().astype(bool)
+
     def _main_blocks(self, df: pd.DataFrame) -> list[np.ndarray]:
         self._check_fitted()
         missing = [c for c in self.attribute_cols if c not in df.columns]
         if missing:
             raise KeyError(f"в данных нет колонок-атрибутов: {missing}")
+        if self.include_none and NONE_COLUMN not in df.columns:
+            raise KeyError(
+                f"include_none=True, но в плане нет колонки {NONE_COLUMN!r}: "
+                f"строки None-концепта неотличимы от обычных профилей"
+            )
 
+        is_none = self.none_mask(df)
         blocks: list[np.ndarray] = []
         for attr in self.attribute_cols:
             lv = self.levels_[attr]
             index = {level: i for i, level in enumerate(lv)}
             pos = df[attr].map(index)
-            if pos.isna().any():
-                unknown = sorted({str(v) for v in df.loc[pos.isna(), attr].unique()})
+            # у None-концепта атрибутов нет, поэтому пропуски в его строках
+            # ожидаемы и не считаются неизвестным уровнем
+            invalid = pos.isna().to_numpy() & ~is_none
+            if invalid.any():
+                unknown = sorted({str(v) for v in df.loc[invalid, attr].unique()})
                 raise ValueError(f"атрибут {attr!r}: неизвестные уровни {unknown}")
-            blocks.append(self.basis_[attr][pos.to_numpy(dtype=int)])
+            block = np.zeros((len(df), len(lv) - 1))
+            real = ~is_none
+            if real.any():
+                block[real] = self.basis_[attr][pos.to_numpy()[real].astype(int)]
+            blocks.append(block)
         return blocks
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
-        """Матрица плана: главные эффекты, затем взаимодействия."""
+        """Матрица плана: главные эффекты, затем None, затем взаимодействия."""
         blocks = self._main_blocks(df)
         by_attr = dict(zip(self.attribute_cols, blocks))
+        if self.include_none:
+            blocks.append(self.none_mask(df).astype(float).reshape(-1, 1))
         for a, b in self.interactions:
             ea, eb = by_attr[a], by_attr[b]
-            # построчное внешнее произведение -> (n, (Ka-1) * (Kb-1))
+            # построчное внешнее произведение -> (n, (Ka-1) * (Kb-1));
+            # у строк None оба сомножителя нулевые, поэтому произведение тоже
             blocks.append((ea[:, :, None] * eb[:, None, :]).reshape(len(ea), -1))
         return np.hstack(blocks)
 
@@ -362,6 +443,10 @@ def interaction_cell_counts(
     идентифицирован данными и держится исключительно на шринкедже от модели
     верхнего уровня.
     """
+    # строки None-концепта не несут атрибутов и в статистику ячеек не входят
+    if NONE_COLUMN in design_df.columns:
+        design_df = design_df[design_df[NONE_COLUMN].fillna(0) == 0]
+
     respondents = _sort_levels(pd.unique(design_df["respondent_id"]))
     rows = []
     for a, b in pairs:
@@ -419,6 +504,13 @@ class CBCDesignGenerator:
         Пары атрибутов, для которых планируется оценка взаимодействий. План
         оптимизируется с учётом интеракционных колонок, иначе ячейки A x B
         оказываются несбалансированными.
+    include_none
+        Добавлять в каждую задачу None-концепт («не выбрал бы ничего»). Он
+        получает ``concept_id = concepts_per_task + 1``, признак ``is_none = 1``
+        и пропуски во всех колонках-атрибутах. В баланс уровней, запреты и
+        расчёт D-эффективности он не входит: у него нет атрибутов.
+        Обратите внимание, что ``concepts_per_task`` задаёт число *реальных*
+        профилей, а None добавляется сверх него.
     n_starts
         Число случайных перезапусков; выбирается план с лучшей средней
         D-эффективностью по респондентам.
@@ -433,6 +525,7 @@ class CBCDesignGenerator:
         num_respondents: int,
         control_attributes: Sequence[str] | str | None = None,
         interactions: Sequence[tuple[str, str]] | None = None,
+        include_none: bool = False,
         n_starts: int = 20,
         random_state: int | None = None,
     ) -> None:
@@ -445,9 +538,12 @@ class CBCDesignGenerator:
         if n_starts < 1:
             raise ValueError("n_starts должно быть >= 1")
 
-        self.coder = EffectsCoder(attribute_cols, interactions=interactions).fit(source)
+        self.coder = EffectsCoder(
+            attribute_cols, interactions=interactions, include_none=include_none
+        ).fit(source)
         self.attribute_cols = self.coder.attribute_cols
         self.levels_ = self.coder.levels_
+        self.include_none = bool(include_none)
         self.concepts_per_task = int(concepts_per_task)
         self.tasks_per_respondent = int(tasks_per_respondent)
         self.num_respondents = int(num_respondents)
@@ -530,18 +626,48 @@ class CBCDesignGenerator:
                     data[attr] = self._control_column(levels, rng)
                 else:
                     data[attr] = self._balanced_deck(levels, n_slots, rng)
-            frames.append(pd.DataFrame(data))
+            frame = pd.DataFrame(data)
+            if self.include_none:
+                frame[NONE_COLUMN] = 0
+                frame = pd.concat([frame, self._none_rows(respondent)], ignore_index=True)
+                frame = frame.sort_values(list(ID_COLUMNS), ignore_index=True)
+            frames.append(frame)
         return pd.concat(frames, ignore_index=True)
+
+    def _none_rows(self, respondent: int) -> pd.DataFrame:
+        """По одной строке None-концепта на каждую задачу респондента."""
+        rows = pd.DataFrame(
+            {
+                "respondent_id": respondent,
+                "task_id": np.arange(1, self.tasks_per_respondent + 1),
+                "concept_id": self.concepts_per_task + 1,
+                NONE_COLUMN: 1,
+            }
+        )
+        for attr in self.attribute_cols:
+            # у None-концепта атрибутов нет: пропуск, а не служебный уровень,
+            # иначе он был бы распознан как обычный уровень атрибута
+            rows[attr] = pd.NA
+        return rows
+
+    def _real_rows(self, design: pd.DataFrame) -> pd.DataFrame:
+        """Строки реальных профилей: без None-концепта."""
+        if NONE_COLUMN not in design.columns:
+            return design
+        return design[design[NONE_COLUMN].fillna(0) == 0]
 
     def _mean_efficiency(self, design: pd.DataFrame) -> tuple[float, float]:
         """Средняя и минимальная D-эффективность по индивидуальным блокам плана.
 
         Для HB значима именно индивидуальная эффективность: полезности
-        оцениваются для каждого респондента отдельно.
+        оцениваются для каждого респондента отдельно. Строки и колонка
+        None-концепта в расчёт не входят — у него нет атрибутов, а его колонка
+        не центрирована и нарушила бы структуру ортогонального идеала.
         """
+        real = self._real_rows(design)
         ideal = self.coder.ideal_information()
-        x = self.coder.transform(design)
-        respondents = design["respondent_id"].to_numpy()
+        x = self.coder.transform(real)[:, self.coder.design_column_indices_]
+        respondents = real["respondent_id"].to_numpy()
         scores = [
             _relative_d_efficiency(x[respondents == r], ideal)
             for r in np.unique(respondents)
@@ -575,10 +701,13 @@ class CBCDesignGenerator:
         design = self.design_ if design is None else design
         if design is None:
             raise RuntimeError("план не сгенерирован: сначала вызовите generate()")
+        # None-концепт исключается: у него нет уровня, и пропуск в подсчёте
+        # уникальных значений выглядел бы как ложное нарушение запрета
+        real = self._real_rows(design)
         violations: dict[str, int] = {}
         for attr in self.control_attributes:
             duplicated = (
-                design.groupby(["respondent_id", "task_id"], observed=True)[attr]
+                real.groupby(["respondent_id", "task_id"], observed=True)[attr]
                 .agg(lambda s: s.nunique() != len(s))
                 .sum()
             )
@@ -591,11 +720,12 @@ class CBCDesignGenerator:
         design = self.design_ if design is None else design
         if design is None:
             raise RuntimeError("план не сгенерирован: сначала вызовите generate()")
+        real = self._real_rows(design)
         rows = []
-        total = len(design)
+        total = len(real)
         for attr in self.attribute_cols:
             expected = total / len(self.levels_[attr])
-            counts = design[attr].value_counts()
+            counts = real[attr].value_counts()
             for level in self.levels_[attr]:
                 count = int(counts.get(level, 0))
                 rows.append(
@@ -667,12 +797,49 @@ class CBCHierarchicalBayesEstimator:
     более узкий приор, а масштабы — ``HalfNormal`` с малым сигма, что даёт
     целенаправленный шринкедж к нулю.
 
+    Режим allocation и вес наблюдения
+    ---------------------------------
+    Распределение баллов моделируется взвешенным логарифмическим
+    правдоподобием, а не ``pm.Multinomial`` с ``n = allocation_total``.
+    Разница принципиальна: мультиномиальное правдоподобие трактует 100
+    распределённых баллов как 100 независимых выборов, тогда как это одно
+    суждение, выраженное на шкале. На замере (8 респондентов, 10 задач) переход
+    от веса 1 к весу 100 сужает апостериорные интервалы индивидуальных
+    полезностей примерно втрое; коэффициент зависит от того, насколько сильно
+    шринкедж верхнего уровня удерживает индивидуальные оценки, и растёт с
+    числом задач. Опасность в том, что диагностика при этом молчит: ``r_hat``,
+    ESS и число дивергенций выглядят нормально, а интервалы уже занижены.
+
+    Поэтому доли баллов переводятся в дробный вес задачи, а ``allocation_weight``
+    задаёт информативность одной задачи в единицах «одного выбора». Значение
+    1.0 консервативно; значения 2-3 защитимы, если считать, что аллокация несёт
+    больше информации, чем принудительный выбор. Установка веса равным сумме
+    баллов воспроизводит наивное поведение и не рекомендуется.
+
     Parameters
     ----------
     attribute_cols
         Колонки-атрибуты продукта.
     interactions
         Пары атрибутов для оценки взаимодействий первого порядка.
+    response_mode
+        Режим ответов. ``"single_choice"`` — респондент выбирает ровно один
+        концепт. ``"allocation"`` — распределяет фиксированную сумму (обычно
+        100%) между концептами. Схема ``responses_df`` в обоих случаях одна:
+        идентификаторы плюс одна числовая колонка ответа; меняются только
+        правила её проверки.
+    include_none
+        Учитывать None-концепт («не выбрал бы ничего»). Требует, чтобы в плане
+        была колонка ``is_none`` и ровно один такой концепт в каждой задаче.
+        Оценивается как индивидуальная константа альтернативы; в важность
+        атрибутов не входит.
+    allocation_total
+        Ожидаемая сумма баллов в задаче для режима ``allocation``. ``None`` —
+        определить по первой задаче и потребовать того же от остальных.
+    allocation_weight
+        Вес одной задачи с аллокацией в правдоподобии. По умолчанию 1.0: задача
+        несёт столько же информации, сколько один принудительный выбор.
+        Увеличивайте осознанно — см. ниже.
     draws, tune, chains, cores
         Параметры NUTS. ``tune`` — итерации прогрева (burn-in).
     target_accept
@@ -690,11 +857,16 @@ class CBCHierarchicalBayesEstimator:
     """
 
     _COV_MODES = ("auto", "full_lkj", "block_lkj", "diagonal")
+    _RESPONSE_MODES = ("single_choice", "allocation")
 
     def __init__(
         self,
         attribute_cols: Sequence[str],
         interactions: Sequence[tuple[str, str]] | None = None,
+        response_mode: str = "single_choice",
+        include_none: bool = False,
+        allocation_total: float | None = None,
+        allocation_weight: float = 1.0,
         draws: int = 1000,
         tune: int = 500,
         chains: int = 4,
@@ -717,9 +889,20 @@ class CBCHierarchicalBayesEstimator:
         if importance_mode not in ("main", "joint"):
             raise ValueError("importance_mode должен быть 'main' или 'joint'")
 
-        self.coder = EffectsCoder(attribute_cols, interactions=interactions)
+        if response_mode not in self._RESPONSE_MODES:
+            raise ValueError(f"response_mode должен быть одним из {self._RESPONSE_MODES}")
+        if allocation_weight <= 0:
+            raise ValueError("allocation_weight должен быть положительным")
+
+        self.coder = EffectsCoder(
+            attribute_cols, interactions=interactions, include_none=include_none
+        )
         self.attribute_cols = self.coder.attribute_cols
         self.interactions = self.coder.interactions
+        self.include_none = self.coder.include_none
+        self.response_mode = response_mode
+        self.allocation_total = allocation_total
+        self.allocation_weight = float(allocation_weight)
         self.draws = int(draws)
         self.tune = int(tune)
         self.chains = int(chains)
@@ -748,6 +931,60 @@ class CBCHierarchicalBayesEstimator:
 
     # ---------------------------------------------------------- подготовка
 
+    @staticmethod
+    def resolve_response_column(responses_df: pd.DataFrame) -> str:
+        """Найти колонку с ответом среди допустимых имён.
+
+        Схема ``responses_df`` одна на оба режима: идентификаторы плюс одна
+        числовая колонка ответа. Имя берётся первым из
+        ``response`` / ``chosen`` / ``allocation`` — это синонимы, а не
+        разные форматы.
+        """
+        for name in RESPONSE_COLUMNS:
+            if name in responses_df.columns:
+                return name
+        raise KeyError(
+            f"responses_df: нет колонки с ответом, ожидалась одна из {list(RESPONSE_COLUMNS)}"
+        )
+
+    def _validate_responses(self, values: np.ndarray, keys: pd.DataFrame) -> None:
+        """Проверить ответы по правилам выбранного режима.
+
+        Обе ветки работают с одним и тем же массивом ``(задачи, альтернативы)``:
+        режим меняет правила, но не структуру данных.
+        """
+        if np.isnan(values).any():
+            raise ValueError("в ответах есть пропуски")
+        if (values < 0).any():
+            raise ValueError("ответы не могут быть отрицательными")
+
+        totals = values.sum(axis=1)
+        if self.response_mode == "single_choice":
+            one_hot = np.isin(values, (0.0, 1.0)).all(axis=1) & (totals == 1.0)
+            bad = np.flatnonzero(~one_hot)
+            if bad.size:
+                sample = keys.iloc[bad[:3]].to_dict("records")
+                raise ValueError(
+                    f"режим single_choice требует ровно один выбор на задачу "
+                    f"(значения 0/1); нарушено в {bad.size} задачах, например: {sample}"
+                )
+            return
+
+        expected = self.allocation_total
+        if expected is None:
+            expected = float(totals[0])
+            self.allocation_total = expected
+        if expected <= 0:
+            raise ValueError("allocation_total должен быть положительным")
+        bad = np.flatnonzero(~np.isclose(totals, expected))
+        if bad.size:
+            sample = keys.iloc[bad[:3]].to_dict("records")
+            raise ValueError(
+                f"режим allocation требует, чтобы сумма по задаче равнялась "
+                f"{expected:g}; нарушено в {bad.size} задачах, например: {sample} "
+                f"(суммы {np.round(totals[bad[:3]], 3).tolist()})"
+            )
+
     def _prepare(
         self, design_df: pd.DataFrame, responses_df: pd.DataFrame
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
@@ -755,26 +992,17 @@ class CBCHierarchicalBayesEstimator:
             missing = [c for c in ID_COLUMNS if c not in frame.columns]
             if missing:
                 raise KeyError(f"{name}: отсутствуют колонки {missing}")
-        if "chosen" not in responses_df.columns:
-            raise KeyError("responses_df: отсутствует колонка 'chosen' (0/1)")
+        column = self.resolve_response_column(responses_df)
 
         merged = design_df.merge(
-            responses_df[[*ID_COLUMNS, "chosen"]],
+            responses_df[[*ID_COLUMNS, column]].rename(columns={column: "response"}),
             on=list(ID_COLUMNS),
             how="left",
             validate="one_to_one",
         )
-        if merged["chosen"].isna().any():
-            n = int(merged["chosen"].isna().sum())
+        if merged["response"].isna().any():
+            n = int(merged["response"].isna().sum())
             raise ValueError(f"для {n} строк плана нет ответа в responses_df")
-
-        chosen_per_task = merged.groupby(list(ID_COLUMNS[:2]), observed=True)["chosen"].sum()
-        bad = chosen_per_task[chosen_per_task != 1]
-        if len(bad):
-            raise ValueError(
-                f"режим single_choice требует ровно один выбор на задачу; "
-                f"нарушено в {len(bad)} задачах, например: {bad.head(3).to_dict()}"
-            )
 
         merged = merged.sort_values(list(ID_COLUMNS)).reset_index(drop=True)
 
@@ -793,13 +1021,26 @@ class CBCHierarchicalBayesEstimator:
                 f"найдено от {n_tasks_per.min()} до {n_tasks_per.max()}"
             )
 
+        if self.include_none:
+            per_task_none = merged.groupby(list(ID_COLUMNS[:2]), observed=True)[NONE_COLUMN].sum()
+            if not (per_task_none == 1).all():
+                raise ValueError(
+                    "include_none=True требует ровно один None-концепт в каждой задаче; "
+                    f"найдено от {per_task_none.min()} до {per_task_none.max()}"
+                )
+
         respondents = merged["respondent_id"].drop_duplicates().to_numpy()
         n_resp = len(respondents)
 
+        values = merged["response"].to_numpy(dtype=float)
+        self._validate_responses(
+            values.reshape(-1, n_concepts),
+            merged.iloc[::n_concepts][list(ID_COLUMNS[:2])].reset_index(drop=True),
+        )
+
         x = self.coder.transform(merged).reshape(n_resp, n_tasks, n_concepts, self.coder.n_params)
-        chosen = merged["chosen"].to_numpy(dtype=float).reshape(n_resp, n_tasks, n_concepts)
-        y = chosen.argmax(axis=-1)
-        return x, y, respondents, merged
+        response = values.reshape(n_resp, n_tasks, n_concepts)
+        return x, response, respondents, merged
 
     def _check_sparsity(self, design_df: pd.DataFrame) -> None:
         """Проверить заполненность ячеек взаимодействий до запуска MCMC."""
@@ -831,25 +1072,26 @@ class CBCHierarchicalBayesEstimator:
 
     # ---------------------------------------------------------------- модель
 
-    def _build_model(self, x: np.ndarray, y: np.ndarray, respondents: np.ndarray) -> Any:
+    def _build_model(self, x: np.ndarray, response: np.ndarray, respondents: np.ndarray) -> Any:
         import pymc as pm
         import pytensor.tensor as pt
 
         n_resp, n_tasks, n_concepts, n_params = x.shape
-        n_main = self.coder.n_main
+        # блок «не-взаимодействий» — главные эффекты плюс константа None
+        n_structural = self.coder.n_structural
         n_int = self.coder.n_interaction
         mode = self.cov_mode_
 
         coords = {
             "param": self.coder.coded_columns_,
-            "param_main": self.coder.main_columns_,
+            "param_structural": self.coder.main_columns_ + self.coder.none_columns_,
             "param_interaction": self.coder.interaction_columns_,
             "respondent": respondents.tolist(),
         }
 
         alpha_sd = np.concatenate(
             [
-                np.full(n_main, self.prior_alpha_sd),
+                np.full(n_structural, self.prior_alpha_sd),
                 np.full(n_int, self.prior_alpha_sd_interaction),
             ]
         )
@@ -860,7 +1102,7 @@ class CBCHierarchicalBayesEstimator:
 
             if mode == "diagonal":
                 sigma_sd = np.concatenate(
-                    [np.ones(n_main), np.full(n_int, self.interaction_sd_prior)]
+                    [np.ones(n_structural), np.full(n_int, self.interaction_sd_prior)]
                 )
                 sigma = pm.HalfNormal("sigma", sigma=sigma_sd, dims="param")
                 z = pm.Normal("z", 0.0, 1.0, dims=("respondent", "param"))
@@ -877,30 +1119,43 @@ class CBCHierarchicalBayesEstimator:
                 beta_raw = alpha + pt.dot(z, chol.T)
             else:  # block_lkj
                 chol, _, _ = pm.LKJCholeskyCov(
-                    "L_main",
-                    n=n_main,
+                    "L_structural",
+                    n=n_structural,
                     eta=self.lkj_eta,
-                    sd_dist=pm.Exponential.dist(1.0, shape=n_main),
+                    sd_dist=pm.Exponential.dist(1.0, shape=n_structural),
                     compute_corr=True,
                 )
-                z_main = pm.Normal("z_main", 0.0, 1.0, dims=("respondent", "param_main"))
-                beta_main = alpha[:n_main] + pt.dot(z_main, chol.T)
+                z_structural = pm.Normal(
+                    "z_structural", 0.0, 1.0, dims=("respondent", "param_structural")
+                )
+                beta_structural = alpha[:n_structural] + pt.dot(z_structural, chol.T)
 
                 sigma_int = pm.HalfNormal(
                     "sigma_interaction", sigma=self.interaction_sd_prior, dims="param_interaction"
                 )
                 z_int = pm.Normal("z_interaction", 0.0, 1.0, dims=("respondent", "param_interaction"))
-                beta_int = alpha[n_main:] + z_int * sigma_int
-                beta_raw = pt.concatenate([beta_main, beta_int], axis=1)
+                beta_int = alpha[n_structural:] + z_int * sigma_int
+                beta_raw = pt.concatenate([beta_structural, beta_int], axis=1)
 
             beta = pm.Deterministic("beta", beta_raw, dims=("respondent", "param"))
-
             utility = (x_t * beta[:, None, None, :]).sum(axis=-1)
-            pm.Categorical(
-                "choice",
-                logit_p=utility.reshape((n_resp * n_tasks, n_concepts)),
-                observed=y.reshape(n_resp * n_tasks),
-            )
+
+            if self.response_mode == "single_choice":
+                pm.Categorical(
+                    "choice",
+                    logit_p=utility.reshape((n_resp * n_tasks, n_concepts)),
+                    observed=response.argmax(axis=-1).reshape(n_resp * n_tasks),
+                )
+            else:
+                # Взвешенное правдоподобие вместо pm.Multinomial: доли баллов
+                # переводятся в дробный вес задачи. Мультиномиальное
+                # правдоподобие с n = allocation_total считало бы 100 баллов
+                # сотней независимых выборов и сузило бы апостериорные интервалы
+                # примерно в 10 раз без единого предупреждения в диагностике.
+                weights = response / response.sum(axis=-1, keepdims=True)
+                weights = weights * self.allocation_weight
+                log_p = pt.special.log_softmax(utility, axis=-1)
+                pm.Potential("allocation", (pt.as_tensor_variable(weights) * log_p).sum())
         return model
 
     # ------------------------------------------------------------------ fit
@@ -913,7 +1168,7 @@ class CBCHierarchicalBayesEstimator:
 
         self.coder.fit(design_df)
         self._check_sparsity(design_df)
-        x, y, respondents, _ = self._prepare(design_df, responses_df)
+        x, response, respondents, _ = self._prepare(design_df, responses_df)
         self.respondent_ids_ = respondents
         self.cov_mode_ = self._resolve_cov_mode()
 
@@ -931,7 +1186,7 @@ class CBCHierarchicalBayesEstimator:
         if target_accept is None:
             target_accept = 0.95 if self.coder.n_interaction else 0.9
 
-        self.model_ = self._build_model(x, y, respondents)
+        self.model_ = self._build_model(x, response, respondents)
         with self.model_:
             self.idata_ = pm.sample(
                 draws=self.draws,
@@ -947,7 +1202,7 @@ class CBCHierarchicalBayesEstimator:
             )
 
         self._collect_diagnostics()
-        self._postprocess(x, y)
+        self._postprocess(x, response)
         return self
 
     # -------------------------------------------------------- диагностика
@@ -1060,16 +1315,20 @@ class CBCHierarchicalBayesEstimator:
         return labels, np.stack(ranges, axis=-1)
 
     def _root_likelihood(
-        self, beta_samples: np.ndarray, x: np.ndarray, y: np.ndarray
+        self, beta_samples: np.ndarray, x: np.ndarray, response: np.ndarray
     ) -> np.ndarray:
-        """RLH — среднее геометрическое вероятности выбранной альтернативы.
+        """RLH — среднее геометрическое вероятности, взвешенное по ответу.
 
-        Считается на каждой итерации и усредняется по апостериорной выборке.
-        Ориентир случайного выбора равен ``1 / concepts_per_task``.
+        Для ``single_choice`` веса — это индикатор выбранной альтернативы, и
+        формула сводится к классическому RLH Sawtooth. Для ``allocation`` веса —
+        доли распределённых баллов, то есть обобщение той же величины на
+        непрерывный ответ. Считается на каждой итерации и усредняется по
+        апостериорной выборке; ориентир случайного выбора — 1 / число
+        альтернатив.
         """
         n_samples = beta_samples.shape[0]
         budget = 40_000_000
-        cost = n_samples * y.size * x.shape[2]
+        cost = n_samples * response.size
         if cost > budget:
             stride = int(np.ceil(cost / budget))
             beta_samples = beta_samples[::stride]
@@ -1077,11 +1336,11 @@ class CBCHierarchicalBayesEstimator:
         shift = utility.max(axis=-1, keepdims=True)
         log_norm = shift + np.log(np.exp(utility - shift).sum(axis=-1, keepdims=True))
         log_prob = utility - log_norm
-        idx = np.broadcast_to(y[None, :, :, None], (log_prob.shape[0], *y.shape, 1))
-        chosen = np.take_along_axis(log_prob, idx, axis=-1)[..., 0]
-        return np.exp(chosen.mean(axis=-1)).mean(axis=0)
+        shares = response / response.sum(axis=-1, keepdims=True)
+        weighted = (shares[None, ...] * log_prob).sum(axis=-1)
+        return np.exp(weighted.mean(axis=-1)).mean(axis=0)
 
-    def _postprocess(self, x: np.ndarray, y: np.ndarray) -> None:
+    def _postprocess(self, x: np.ndarray, response: np.ndarray) -> None:
         beta_samples = self._posterior_beta()
         self.beta_mean_ = beta_samples.mean(axis=0)
         self.respondent_index_ = {rid: i for i, rid in enumerate(self.respondent_ids_)}
@@ -1133,9 +1392,16 @@ class CBCHierarchicalBayesEstimator:
             self.interaction_tables_[pair] = flat
             frame = pd.concat([frame, flat], axis=1)
 
+        # Константа None-концепта: это полезность, но не уровень какого-либо
+        # атрибута, поэтому она не входит ни в нулевую сумму, ни в важность
+        if self.coder.include_none:
+            none_utility = (beta_samples[..., self.coder.none_index_] * scale[..., 0]).mean(axis=0)
+            frame[NONE_PARAM] = none_utility
+            self.utilities_raw_[NONE_PARAM] = beta_samples[..., self.coder.none_index_].mean(axis=0)
+
         for i, label in enumerate(labels):
             frame[f"{label}_Importance"] = importance[:, i]
-        frame["RLH"] = self._root_likelihood(beta_samples, x, y)
+        frame["RLH"] = self._root_likelihood(beta_samples, x, response)
         frame["RLH_null"] = 1.0 / x.shape[2]
         self.individual_results_ = frame
 
@@ -1166,6 +1432,16 @@ class CBCHierarchicalBayesEstimator:
                         "std": frame[column].std(),
                     }
                 )
+        if self.coder.include_none:
+            rows.append(
+                {
+                    "kind": "none",
+                    "attribute": NONE_PARAM,
+                    "level": "",
+                    "mean": frame[NONE_PARAM].mean(),
+                    "std": frame[NONE_PARAM].std(),
+                }
+            )
         for label in labels:
             column = f"{label}_Importance"
             rows.append(
@@ -1199,25 +1475,65 @@ class CBCHierarchicalBayesEstimator:
         rows = design_df["respondent_id"].map(self.respondent_index_).to_numpy(dtype=int)
         return (x * self.beta_mean_[rows]).sum(axis=1)
 
-    def hit_rate(self, design_df: pd.DataFrame, responses_df: pd.DataFrame) -> float:
-        """Доля задач, где предсказанный выбор совпал с фактическим.
-
-        Метрика инвариантна к масштабу полезностей, поэтому пригодна для
-        валидации на отложенных (holdout) задачах.
-        """
+    def _merge_for_validation(
+        self, design_df: pd.DataFrame, responses_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Свести план с ответами и посчитать предсказанные полезности."""
         self._check_fitted()
+        column = self.resolve_response_column(responses_df)
         merged = design_df.merge(
-            responses_df[[*ID_COLUMNS, "chosen"]], on=list(ID_COLUMNS), how="left", validate="one_to_one"
+            responses_df[[*ID_COLUMNS, column]].rename(columns={column: "response"}),
+            on=list(ID_COLUMNS),
+            how="left",
+            validate="one_to_one",
         )
-        if merged["chosen"].isna().any():
+        if merged["response"].isna().any():
             raise ValueError("для части строк плана нет ответа в responses_df")
         merged = merged.sort_values(list(ID_COLUMNS)).reset_index(drop=True)
         merged["utility"] = self.predict_utilities(merged)
+        return merged
 
+    def hit_rate(self, design_df: pd.DataFrame, responses_df: pd.DataFrame) -> float:
+        """Доля задач, где предсказанная лучшая альтернатива совпала с фактической.
+
+        Метрика инвариантна к масштабу полезностей, поэтому пригодна для
+        валидации на отложенных (holdout) задачах. В режиме ``allocation``
+        фактической считается альтернатива с наибольшей долей баллов —
+        это first-choice hit rate; для аллокаций содержательнее
+        :meth:`share_metrics`, поскольку hit rate игнорирует всё распределение
+        баллов, кроме максимума.
+        """
+        merged = self._merge_for_validation(design_df, responses_df)
         grouped = merged.groupby(list(ID_COLUMNS[:2]), observed=True)
         predicted = grouped["utility"].idxmax()
-        actual = grouped["chosen"].idxmax()
+        actual = grouped["response"].idxmax()
         return float((predicted.to_numpy() == actual.to_numpy()).mean())
+
+    def share_metrics(self, design_df: pd.DataFrame, responses_df: pd.DataFrame) -> dict[str, float]:
+        """Согласие предсказанных и фактических долей выбора.
+
+        Основная метрика качества для режима ``allocation``: сравниваются доли
+        внутри каждой задачи, а не только победившая альтернатива. В режиме
+        ``single_choice`` тоже осмысленна — фактические доли там равны 0/1.
+        """
+        merged = self._merge_for_validation(design_df, responses_df)
+        keys = list(ID_COLUMNS[:2])
+        grouped = merged.groupby(keys, observed=True)
+
+        shifted = merged["utility"] - grouped["utility"].transform("max")
+        exponentiated = np.exp(shifted)
+        merged["predicted_share"] = exponentiated / exponentiated.groupby(
+            [merged[k] for k in keys]
+        ).transform("sum")
+        merged["actual_share"] = merged["response"] / grouped["response"].transform("sum")
+
+        predicted = merged["predicted_share"].to_numpy()
+        actual = merged["actual_share"].to_numpy()
+        return {
+            "mae": float(np.abs(predicted - actual).mean()),
+            "rmse": float(np.sqrt(((predicted - actual) ** 2).mean())),
+            "correlation": float(np.corrcoef(predicted, actual)[0, 1]),
+        }
 
     # -------------------------------------------------- график итераций
 
@@ -1352,6 +1668,10 @@ SEGMENTS: dict[str, dict[str, dict[Any, float]]] = {
 # менее чувствителен к росту цены, дешёвый — более.
 INTERACTION_STRENGTH = {"price_sensitive": 0.35, "brand_loyal": 0.9, "balanced": 0.6}
 
+# Истинная полезность отказа от покупки: чувствительные к цене отказываются
+# охотнее, лояльные к бренду — реже.
+NONE_UTILITY = {"price_sensitive": -0.6, "brand_loyal": -1.8, "balanced": -1.2}
+
 
 def _true_interaction_table(coder: EffectsCoder, pair: tuple[str, str]) -> np.ndarray:
     """Базовая таблица взаимодействия с нулевыми суммами по строкам и столбцам."""
@@ -1397,7 +1717,19 @@ def simulate_true_utilities(
             # Gamma — левый верхний блок полной таблицы: остальные ячейки
             # восстанавливаются из ограничений нулевых сумм
             beta[i, interaction_slices[pair]] = scaled[: ka - 1, : kb - 1].reshape(-1)
+        if coder.include_none:
+            # отрицательная константа: отказ от покупки выбирают, но нечасто
+            beta[i, coder.none_index_] = NONE_UTILITY[segment] + rng.normal(0.0, 0.4)
     return beta, segments
+
+
+def _systematic_utility(
+    design_df: pd.DataFrame, coder: EffectsCoder, beta_true: np.ndarray
+) -> np.ndarray:
+    x = coder.transform(design_df)
+    index = {rid: i for i, rid in enumerate(pd.unique(design_df["respondent_id"]))}
+    rows = design_df["respondent_id"].map(index).to_numpy(dtype=int)
+    return (x * beta_true[rows]).sum(axis=1)
 
 
 def simulate_choices(
@@ -1407,16 +1739,48 @@ def simulate_choices(
     rng: np.random.Generator,
 ) -> pd.DataFrame:
     """Ответы по модели MNL: аддитивная ошибка Гумбеля и выбор максимума."""
-    x = coder.transform(design_df)
-    index = {rid: i for i, rid in enumerate(pd.unique(design_df["respondent_id"]))}
-    rows = design_df["respondent_id"].map(index).to_numpy(dtype=int)
-    utility = (x * beta_true[rows]).sum(axis=1) + rng.gumbel(0.0, 1.0, size=len(design_df))
+    utility = _systematic_utility(design_df, coder, beta_true)
+    utility = utility + rng.gumbel(0.0, 1.0, size=len(design_df))
 
     responses = design_df[list(ID_COLUMNS)].copy()
     responses["utility"] = utility
     winners = responses.groupby(list(ID_COLUMNS[:2]), observed=True)["utility"].idxmax()
-    responses["chosen"] = 0
-    responses.loc[winners, "chosen"] = 1
+    responses["response"] = 0
+    responses.loc[winners, "response"] = 1
+    return responses.drop(columns="utility")
+
+
+def simulate_allocations(
+    design_df: pd.DataFrame,
+    coder: EffectsCoder,
+    beta_true: np.ndarray,
+    rng: np.random.Generator,
+    total: float = 100.0,
+    concentration: float = 12.0,
+) -> pd.DataFrame:
+    """Распределение баллов между концептами.
+
+    Ожидаемые доли равны логит-вероятностям выбора, а разброс вокруг них задаёт
+    ``concentration``: чем оно выше, тем ближе ответ к теоретическим долям.
+    Это ровно та модель, для которой предназначен режим ``allocation``, — одно
+    суждение о пропорциях, а не серия независимых выборов.
+    """
+    utility = _systematic_utility(design_df, coder, beta_true)
+    responses = design_df[list(ID_COLUMNS)].copy()
+    responses["utility"] = utility
+
+    keys = list(ID_COLUMNS[:2])
+    grouped = responses.groupby(keys, observed=True)["utility"]
+    exponentiated = np.exp(responses["utility"] - grouped.transform("max"))
+    shares = exponentiated / exponentiated.groupby(
+        [responses[k] for k in keys]
+    ).transform("sum")
+
+    values = np.empty(len(responses))
+    for _, index in responses.groupby(keys, observed=True).indices.items():
+        drawn = rng.dirichlet(concentration * shares.to_numpy()[index] + 1e-9)
+        values[index] = drawn * total
+    responses["response"] = values
     return responses.drop(columns="utility")
 
 
@@ -1444,7 +1808,11 @@ def _rule(title: str) -> None:
     print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
 
 
-def main() -> None:
+def main(
+    response_mode: str = "single_choice",
+    include_none: bool = True,
+    allocation_total: float = 100.0,
+) -> None:
     n_respondents = 30
     concepts_per_task = 3
     tasks_total = 18
@@ -1461,6 +1829,7 @@ def main() -> None:
         num_respondents=n_respondents,
         control_attributes="Brand",
         interactions=interactions,
+        include_none=include_none,
         n_starts=25,
         random_state=20240605,
     )
@@ -1468,7 +1837,12 @@ def main() -> None:
     coder = generator.coder
     print(
         f"строк плана: {len(design)} | параметров: {coder.n_params} "
-        f"(главных {coder.n_main} + взаимодействий {coder.n_interaction})"
+        f"(главных {coder.n_main} + None {coder.n_none} + "
+        f"взаимодействий {coder.n_interaction})"
+    )
+    print(
+        f"альтернатив в задаче: {concepts_per_task} профилей"
+        + (" + None-концепт" if include_none else "")
     )
     print(
         f"D-эффективность по респондентам: средняя {generator.d_efficiency_:.4f}, "
@@ -1483,9 +1857,17 @@ def main() -> None:
 
     _rule("Симуляция гетерогенных респондентов")
     beta_true, segments = simulate_true_utilities(coder, n_respondents, rng)
-    responses = simulate_choices(design, coder, beta_true, rng)
+    if response_mode == "single_choice":
+        responses = simulate_choices(design, coder, beta_true, rng)
+    else:
+        responses = simulate_allocations(design, coder, beta_true, rng, total=allocation_total)
     for name in SEGMENTS:
         print(f"  сегмент {name:<16} — {int((segments == name).sum())} респондентов")
+    print(f"режим ответов: {response_mode}", end="")
+    if response_mode == "allocation":
+        print(f" (по {allocation_total:g} баллов на задачу)")
+    else:
+        print()
 
     fit_mask = design["task_id"] <= tasks_total - holdout_tasks
     design_fit, design_holdout = design[fit_mask], design[~fit_mask]
@@ -1497,7 +1879,10 @@ def main() -> None:
     estimator = CBCHierarchicalBayesEstimator(
         attribute_cols=list(ATTRIBUTE_SPACE),
         interactions=interactions,
-        # 19 параметров при 30 респондентах требуют более длинной адаптации,
+        response_mode=response_mode,
+        include_none=include_none,
+        allocation_total=allocation_total if response_mode == "allocation" else None,
+        # 20 параметров при 30 респондентах требуют более длинной адаптации,
         # чем ориентировочные 500/1000: на коротких цепях r_hat не сходится
         draws=1500,
         tune=1500,
@@ -1561,22 +1946,38 @@ def main() -> None:
         np.corrcoef(true_interaction.ravel(), estimated_interaction.ravel())[0, 1]
     )
 
+    n_alternatives = concepts_per_task + (1 if include_none else 0)
     hit = estimator.hit_rate(design_holdout, responses_holdout)
-    print(f"корреляция полезностей (все респонденты)   : {overall:.3f}")
-    print(f"корреляция полезностей (средняя по людям)  : {within:.3f}")
-    print(f"MAE после приведения масштаба              : {mae:.3f}")
-    print(f"корреляция важностей атрибутов             : {importance_corr:.3f}")
+    shares = estimator.share_metrics(design_holdout, responses_holdout)
+    print(f"корреляция полезностей (все респонденты)    : {overall:.3f}")
+    print(f"корреляция полезностей (средняя по людям)   : {within:.3f}")
+    print(f"MAE после приведения масштаба               : {mae:.3f}")
+    print(f"корреляция важностей атрибутов              : {importance_corr:.3f}")
     print(f"корреляция таблиц взаимодействия Brand*Price: {interaction_corr:.3f}")
-    print(f"hit rate на {holdout_tasks} holdout-задачах            : {hit:.3f} "
-          f"(случайный выбор — {1 / concepts_per_task:.3f})")
-    print(f"средний RLH                                : {results['RLH'].mean():.3f} "
-          f"(случайный выбор — {1 / concepts_per_task:.3f})")
+    if include_none:
+        true_none = beta_true[:, coder.none_index_]
+        none_corr = float(np.corrcoef(true_none, estimator.utilities_raw_[NONE_PARAM])[0, 1])
+        print(f"корреляция константы None-концепта          : {none_corr:.3f}")
+    print(f"hit rate на {holdout_tasks} holdout-задачах             : {hit:.3f} "
+          f"(случайный выбор — {1 / n_alternatives:.3f})")
+    print(f"доли выбора на holdout: MAE {shares['mae']:.3f}, "
+          f"корреляция {shares['correlation']:.3f}")
+    print(f"средний RLH                                 : {results['RLH'].mean():.3f} "
+          f"(случайный выбор — {1 / n_alternatives:.3f})")
 
     _rule("График истории итераций")
-    path = "cbc_hb_trace.png"
+    path = f"cbc_hb_trace_{response_mode}.png"
     estimator.plot_trace_history(var_names=("alpha",), max_params=10, path=path)
     print(f"сохранён: {path}")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    mode = sys.argv[1] if len(sys.argv) > 1 else "single_choice"
+    if mode not in CBCHierarchicalBayesEstimator._RESPONSE_MODES:
+        raise SystemExit(
+            f"использование: python cbc_hb.py "
+            f"[{'|'.join(CBCHierarchicalBayesEstimator._RESPONSE_MODES)}]"
+        )
+    main(response_mode=mode)
