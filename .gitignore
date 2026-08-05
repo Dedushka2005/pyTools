@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-tests/sample.sav
+sample.sav
 *.adl
 *.smt
 cbc_hb_trace*.png

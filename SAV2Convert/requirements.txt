@@ -1,0 +1,10 @@
+# Зависимости инструментов конвертации SPSS (.sav).
+#
+# sav2adl.py                — pyreadstat и pandas.
+# pySmartSPSSExporter.py    — дополнительно openpyxl для выгрузки в Excel.
+#
+# Графический интерфейс использует tkinter из стандартной библиотеки; в
+# некоторых сборках Linux он ставится отдельным пакетом (python3-tk).
+pyreadstat>=1.2
+pandas>=1.3
+openpyxl>=3.1
