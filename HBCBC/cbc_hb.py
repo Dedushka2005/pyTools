@@ -1022,6 +1022,11 @@ class CBCHierarchicalBayesEstimator:
             )
 
         if self.include_none:
+            if NONE_COLUMN not in merged.columns:
+                raise KeyError(
+                    f"include_none=True, но в плане нет колонки {NONE_COLUMN!r}: "
+                    f"строки None-концепта неотличимы от обычных профилей"
+                )
             per_task_none = merged.groupby(list(ID_COLUMNS[:2]), observed=True)[NONE_COLUMN].sum()
             if not (per_task_none == 1).all():
                 raise ValueError(

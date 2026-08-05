@@ -3,8 +3,9 @@
 """Тесты детерминированной части cbc_hb.py — кодирования и генератора плана.
 
 MCMC здесь не запускается: проверяется всё, что должно быть верным
-безотносительно сэмплирования, поэтому тест отрабатывает за секунды и не
-требует установленного PyMC.
+безотносительно сэмплирования, поэтому тест отрабатывает за секунды.
+Единственная проверка, которой нужен PyMC, — сверка двух ветвей правдоподобия;
+без установленного PyMC она пропускается, остальные работают.
 
 Запуск: python tests/test_cbc_hb.py   (или pytest tests/test_cbc_hb.py)
 """
@@ -24,6 +25,7 @@ from cbc_hb import (  # noqa: E402
     CBCHierarchicalBayesEstimator,
     EffectsCoder,
     _relative_d_efficiency,
+    simulate_choices,
     _sort_levels,
     interaction_cell_counts,
 )
@@ -334,6 +336,45 @@ def test_unknown_level_rejected():
     raise AssertionError("ожидалось ValueError для уровня, отсутствующего в обучении")
 
 
+def test_allocation_likelihood_matches_categorical():
+    """При one-hot ответах и весе 1 обе ветки правдоподобия обязаны совпасть.
+
+    Режим allocation с долями 0/1 — это в точности принудительный выбор, так что
+    взвешенное логарифмическое правдоподобие должно дать ровно то же значение,
+    что и pm.Categorical. Проверка связывает новую ветку с проверенной.
+    """
+    try:
+        import pymc  # noqa: F401
+    except ImportError:
+        print("пропуск: PyMC не установлен — проверка правдоподобия не выполняется")
+        return
+
+    generator = make_generator(num_respondents=4, tasks_per_respondent=6, interactions=None)
+    design = generator.generate()
+    rng = np.random.default_rng(11)
+    beta_true = rng.normal(size=(4, generator.coder.n_params)) * 0.8
+    responses = simulate_choices(design, generator.coder, beta_true, rng)
+
+    def build(mode):
+        estimator = CBCHierarchicalBayesEstimator(
+            list(SPACE), response_mode=mode, allocation_weight=1.0, chains=1
+        )
+        estimator.coder.fit(design)
+        x, response, ids, _ = estimator._prepare(design, responses)
+        estimator.respondent_ids_ = ids
+        estimator.cov_mode_ = estimator._resolve_cov_mode()
+        return estimator._build_model(x, response, ids)
+
+    choice_model, allocation_model = build("single_choice"), build("allocation")
+    choice_logp = choice_model.compile_logp()
+    allocation_logp = allocation_model.compile_logp()
+
+    for seed in range(4):
+        point = choice_model.initial_point(random_seed=seed)
+        assert np.isclose(choice_logp(point), allocation_logp(point), atol=1e-8)
+    print("ok: правдоподобие allocation совпадает с категориальным на one-hot ответах")
+
+
 def test_all():
     test_level_detection_and_ordering()
     test_effects_coding_shape_and_values()
@@ -349,6 +390,7 @@ def test_all():
     test_allocation_validation()
     test_none_concept_coding()
     test_none_concept_design()
+    test_allocation_likelihood_matches_categorical()
     test_unbalanced_tasks_rejected()
     test_unknown_level_rejected()
 
