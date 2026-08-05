@@ -1818,6 +1818,8 @@ def main(
     include_none: bool = True,
     allocation_total: float = 100.0,
     cores: int | None = None,
+    draws: int = 1500,
+    tune: int = 1500,
 ) -> None:
     n_respondents = 30
     concepts_per_task = 3
@@ -1890,8 +1892,8 @@ def main(
         allocation_total=allocation_total if response_mode == "allocation" else None,
         # 20 параметров при 30 респондентах требуют более длинной адаптации,
         # чем ориентировочные 500/1000: на коротких цепях r_hat не сходится
-        draws=1500,
-        tune=1500,
+        draws=draws,
+        tune=tune,
         chains=4,
         cores=cores,
         upper_level_cov="auto",
@@ -1924,7 +1926,9 @@ def main(
 
     _rule("Валидация: восстановлены ли истинные параметры")
     true_full = coder.expand_main(beta_true)
-    estimated_full = estimator.utilities_raw_.to_numpy()
+    # только полезности уровней атрибутов: константа None-концепта в
+    # utilities_raw_ есть, но в expand_main() её нет — она не уровень атрибута
+    estimated_full = estimator.utilities_raw_[coder.utility_columns_].to_numpy()
     overall = float(np.corrcoef(true_full.ravel(), estimated_full.ravel())[0, 1])
     within = _mean_within_respondent_correlation(true_full, estimated_full)
     mae = _scale_normalised_mae(true_full, estimated_full)
