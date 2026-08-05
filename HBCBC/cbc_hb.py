@@ -1817,6 +1817,7 @@ def main(
     response_mode: str = "single_choice",
     include_none: bool = True,
     allocation_total: float = 100.0,
+    cores: int | None = None,
 ) -> None:
     n_respondents = 30
     concepts_per_task = 3
@@ -1892,6 +1893,7 @@ def main(
         draws=1500,
         tune=1500,
         chains=4,
+        cores=cores,
         upper_level_cov="auto",
         normalization="zcd",
         importance_mode="main",
@@ -1983,6 +1985,9 @@ if __name__ == "__main__":
     if mode not in CBCHierarchicalBayesEstimator._RESPONSE_MODES:
         raise SystemExit(
             f"использование: python cbc_hb.py "
-            f"[{'|'.join(CBCHierarchicalBayesEstimator._RESPONSE_MODES)}]"
+            f"[{'|'.join(CBCHierarchicalBayesEstimator._RESPONSE_MODES)}] [число_процессов]"
         )
-    main(response_mode=mode)
+    # второй аргумент — число процессов; 1 отключает многопроцессный сэмплинг,
+    # что полезно в окружениях, где межпроцессное взаимодействие ненадёжно
+    n_cores = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    main(response_mode=mode, cores=n_cores)
