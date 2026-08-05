@@ -1,0 +1,9 @@
+# Зависимости модуля cbc_hb.py (Choice-Based Conjoint / Hierarchical Bayes).
+# Держатся отдельно от requirements.txt: конвертеру sav2adl тяжёлый
+# байесовский стек не нужен.
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+pymc>=5.10
+arviz>=0.17
+matplotlib>=3.7
