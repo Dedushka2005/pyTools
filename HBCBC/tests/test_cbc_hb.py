@@ -216,6 +216,29 @@ def test_response_validation():
     raise AssertionError("ожидалось ValueError при двух выборах в одной задаче")
 
 
+def test_duplicate_keys_rejected():
+    generator = make_generator(num_respondents=2, tasks_per_respondent=4)
+    design = generator.generate()
+    estimator = CBCHierarchicalBayesEstimator(list(SPACE), interactions=[PAIR])
+    estimator.coder.fit(design)
+
+    responses = design[["respondent_id", "task_id", "concept_id"]].copy()
+    responses["response"] = (responses["concept_id"] == 1).astype(int)
+
+    for label, frames in (
+        ("responses_df", (design, pd.concat([responses, responses.iloc[[0]]], ignore_index=True))),
+        ("design_df", (pd.concat([design, design.iloc[[0]]], ignore_index=True), responses)),
+    ):
+        try:
+            estimator._prepare(*frames)
+        except ValueError as exc:
+            assert label in str(exc)
+            assert "уникальной" in str(exc)
+        else:
+            raise AssertionError(f"ожидалось ValueError при дубле ключа в {label}")
+    print("ok: повтор тройки идентификаторов отвергается в обеих таблицах")
+
+
 def test_response_column_is_one_schema():
     # response / chosen / allocation — синонимы одной колонки, а не три формата
     frame = pd.DataFrame({"respondent_id": [1], "task_id": [1], "concept_id": [1]})
@@ -386,6 +409,7 @@ def test_all():
     test_d_efficiency_degenerate_design()
     test_sparsity_report_counts_empty_cells()
     test_response_validation()
+    test_duplicate_keys_rejected()
     test_response_column_is_one_schema()
     test_allocation_validation()
     test_none_concept_coding()

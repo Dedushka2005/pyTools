@@ -994,6 +994,15 @@ class CBCHierarchicalBayesEstimator:
                 raise KeyError(f"{name}: отсутствуют колонки {missing}")
         column = self.resolve_response_column(responses_df)
 
+        for name, frame in (("design_df", design_df), ("responses_df", responses_df)):
+            duplicated = frame.duplicated(subset=list(ID_COLUMNS))
+            if duplicated.any():
+                sample = frame.loc[duplicated, list(ID_COLUMNS)].head(3).to_dict("records")
+                raise ValueError(
+                    f"{name}: тройка (respondent_id, task_id, concept_id) должна быть "
+                    f"уникальной; найдено {int(duplicated.sum())} повторов, например: {sample}"
+                )
+
         merged = design_df.merge(
             responses_df[[*ID_COLUMNS, column]].rename(columns={column: "response"}),
             on=list(ID_COLUMNS),

@@ -144,6 +144,282 @@ estimator.population_summary_    # сводка по выборке
 estimator.plot_trace_history(path="trace.png")
 ```
 
+## Форматы данных
+
+### Вход: план опроса `design_df`
+
+Длинная таблица — одна строка на одну альтернативу одной задачи одного
+респондента.
+
+| колонка | тип | обязательна | описание |
+|---|---|---|---|
+| `respondent_id` | любой хешируемый | да | идентификатор респондента |
+| `task_id` | любой хешируемый | да | номер задачи выбора внутри респондента |
+| `concept_id` | любой хешируемый | да | номер альтернативы внутри задачи |
+| колонки атрибутов | любой хешируемый | да | по одной на атрибут, значение — уровень |
+| `is_none` | 0/1 | только при `include_none=True` | признак строки None-концепта |
+
+Пример плана на 3 атрибута с None-концептом:
+
+```
+respondent_id  task_id  concept_id  Brand  Price  Storage  is_none
+            1        1           1  Alpha    299    256GB        0
+            1        1           2  Gamma    499    256GB        0
+            1        1           3   <NA>   <NA>     <NA>        1
+            1        2           1   Beta    299    128GB        0
+```
+
+Требования, которые проверяются до запуска MCMC:
+
+* тройка `(respondent_id, task_id, concept_id)` уникальна;
+* число альтернатив одинаково во всех задачах;
+* число задач одинаково у всех респондентов;
+* у каждого атрибута не меньше двух уровней;
+* при `include_none=True` — ровно один концепт с `is_none == 1` в каждой задаче,
+  и атрибуты в этой строке пустые (`NaN`/`None`, а не служебный уровень вроде
+  строки `"none"`: иначе он будет распознан как обычный уровень атрибута).
+
+Уровни атрибутов **не задаются вручную** — они считываются из данных. Порядок
+детерминирован: числовые уровни сортируются по значению, остальные
+лексикографически, и последний становится референсным. Референсный уровень
+влияет только на внутреннее кодирование: в выдаче присутствуют полезности всех
+уровней.
+
+### Вход: ответы `responses_df`
+
+Схема одна на оба режима — идентификаторы плюс одна числовая колонка ответа.
+Имя колонки берётся первым из `response`, `chosen`, `allocation`; это синонимы,
+а не разные форматы.
+
+| колонка | тип | описание |
+|---|---|---|
+| `respondent_id`, `task_id`, `concept_id` | как в плане | должны совпадать с планом один в один |
+| `response` (или `chosen` / `allocation`) | число | значение зависит от режима |
+
+**Режим `single_choice`** — значения 0/1, ровно одна единица на задачу:
+
+```
+respondent_id  task_id  concept_id  response
+            1        1           1         1
+            1        1           2         0
+            1        1           3         0
+```
+
+**Режим `allocation`** — неотрицательные числа с одинаковой суммой во всех
+задачах. Нули допустимы, дробные значения тоже:
+
+```
+respondent_id  task_id  concept_id  response
+            1        1           1      92.9
+            1        1           2       0.0
+            1        1           3       7.1
+```
+
+Сумма задаётся параметром `allocation_total`. Если он не указан, берётся сумма
+первой задачи и того же требуют от остальных — то есть опечатка в одной строке
+не пройдёт незамеченной.
+
+Ответ должен быть для каждой строки плана: если хоть одна строка осталась без
+ответа, расчёт останавливается с указанием их количества.
+
+### Чтение из файлов
+
+Модуль работает с `DataFrame`, а не с файлами напрямую, поэтому подойдёт любой
+источник, который читает pandas:
+
+```python
+import pandas as pd
+
+design = pd.read_csv("design.csv")
+responses = pd.read_csv("responses.csv")
+
+# или из Excel
+design = pd.read_excel("study.xlsx", sheet_name="design")
+responses = pd.read_excel("study.xlsx", sheet_name="responses")
+```
+
+Про типы стоит знать две вещи.
+
+Числовые уровни переживают запись в CSV и чтение обратно, даже если превращаются
+из `299` в `299.0`: Python считает эти значения равными, и распознавание уровней
+не ломается. Изменятся только имена колонок в выдаче — `Price=299.0` вместо
+`Price=299`.
+
+А вот смешение чисел со строками ломает всё: если уровни объявлены как `[299,
+499]`, а в данных лежат `"299"` и `"499"` (или наоборот), расчёт остановится с
+сообщением `атрибут 'Price': неизвестные уровни ['299', '499']`. Это бывает при
+чтении с `dtype=str`. Держите атрибуты в одном типе во всех источниках.
+
+### Выход: `individual_results_`
+
+Главная таблица результатов. Индекс — `respondent_id`, по строке на человека.
+Колонки идут группами:
+
+| группа | пример имени | что означает |
+|---|---|---|
+| полезности уровней | `Brand=Alpha`, `Price=299` | по одной колонке на каждый уровень каждого атрибута, включая референсный |
+| ячейки взаимодействий | `Brand=Alpha x Price=299` | полная таблица `K_a × K_b` для каждой объявленной пары |
+| константа None | `None` | только при `include_none=True` |
+| важность атрибутов | `Brand_Importance` | проценты, сумма по строке ровно 100 |
+| качество посадки | `RLH`, `RLH_null` | посадка респондента и ориентир случайного выбора |
+
+Сохраняется как обычный `DataFrame`:
+
+```python
+estimator.individual_results_.to_csv("utilities.csv", encoding="utf-8")
+estimator.individual_results_.to_excel("utilities.xlsx")
+```
+
+Полезности внутри атрибута в сумме дают ноль, а при `normalization="zcd"`
+дополнительно отмасштабированы так, что средний размах атрибута равен 100 —
+это делает людей сопоставимыми между собой.
+
+### Выход: `population_summary_`
+
+Сводка по выборке в длинном формате: по строке на каждую величину.
+
+| колонка | описание |
+|---|---|
+| `kind` | `utility`, `interaction`, `none`, `importance` или `fit` |
+| `attribute` | атрибут, пара атрибутов или имя показателя |
+| `level` | уровень (пусто для важности и `fit`) |
+| `mean`, `std` | среднее и стандартное отклонение по респондентам |
+
+```
+   kind attribute level    mean    std
+utility     Brand Alpha  72.092  3.623
+utility     Brand  Beta -32.365 14.682
+```
+
+Важность здесь — среднее индивидуальных процентов, а не важность, посчитанная
+из средних полезностей: это разные числа, и Sawtooth считает первым способом.
+
+### Выход: остальные атрибуты и методы
+
+| что | тип | содержимое |
+|---|---|---|
+| `interaction_tables_` | `dict` пара → `DataFrame` | таблицы взаимодействий отдельно от общей выдачи |
+| `utilities_raw_` | `DataFrame` | полезности без ZCD-нормализации, для сверки с внешними расчётами |
+| `diagnostics_` | `dict` | `max_r_hat`, `min_ess_bulk`, `divergences`, `n_params`, `upper_level_cov`, `summary` |
+| `sparsity_report_` | `DataFrame` | заполненность ячеек взаимодействий по респондентам |
+| `beta_mean_` | `ndarray (N, P)` | апостериорные средние в закодированном пространстве |
+| `idata_` | `arviz.InferenceData` | полная апостериорная выборка вместе с прогревом |
+| `predict_utilities(design)` | `ndarray` | суммарная полезность каждой строки плана |
+| `hit_rate(design, responses)` | `float` | доля задач с угаданной лучшей альтернативой |
+| `share_metrics(design, responses)` | `dict` | `mae`, `rmse`, `correlation` по долям выбора |
+| `plot_trace_history(...)` | `Figure` | график истории итераций |
+
+## Сценарий: режим single_choice
+
+Полный цикл от плана до выгрузки полезностей.
+
+```python
+import pandas as pd
+from cbc_hb import CBCDesignGenerator, CBCHierarchicalBayesEstimator
+
+space = {
+    "Brand":    ["Alpha", "Beta", "Gamma", "Delta"],
+    "Price":    [299, 399, 499, 599],
+    "Storage":  ["128GB", "256GB", "512GB"],
+    "Warranty": ["1 year", "2 years", "3 years"],
+}
+
+# 1. План опроса
+generator = CBCDesignGenerator(
+    space,
+    attribute_cols=list(space),
+    concepts_per_task=3,          # реальных профилей на экране
+    tasks_per_respondent=15,
+    num_respondents=300,
+    control_attributes="Brand",   # бренд не повторяется внутри задачи
+    interactions=[("Brand", "Price")],
+    include_none=True,            # плюс вариант «ничего не выберу»
+    random_state=42,
+)
+design = generator.generate()
+
+# Проверить план до полевых работ
+print(generator.check_prohibitions())        # ожидается пустой словарь
+print(generator.balance_report())
+print(generator.interaction_report())        # пустые ячейки видны здесь
+print(f"D-эффективность: {generator.d_efficiency_:.3f}")
+
+design.to_csv("design.csv", index=False)     # отдать в систему опроса
+
+# 2. Ответы возвращаются из поля в том же длинном формате
+responses = pd.read_csv("responses.csv")     # колонка response: 0/1
+
+# 3. Оценка
+estimator = CBCHierarchicalBayesEstimator(
+    attribute_cols=list(space),
+    interactions=[("Brand", "Price")],
+    response_mode="single_choice",
+    include_none=True,
+    draws=1500,
+    tune=1500,
+    chains=4,
+)
+estimator.fit(design, responses)
+
+# 4. Диагностика — до того, как смотреть на числа
+print(estimator.diagnostics_["max_r_hat"])      # нужно <= 1.01
+print(estimator.diagnostics_["divergences"])    # нужно 0
+
+# 5. Результаты
+estimator.individual_results_.to_csv("utilities.csv", encoding="utf-8")
+estimator.population_summary_.to_csv("summary.csv", index=False, encoding="utf-8")
+estimator.plot_trace_history(path="trace.png")
+```
+
+Валидация на отложенных задачах, если часть задач не участвовала в оценке:
+
+```python
+fit_mask = design["task_id"] <= 12
+estimator.fit(design[fit_mask], responses[responses["task_id"] <= 12])
+
+holdout = design[~fit_mask]
+holdout_responses = responses[responses["task_id"] > 12]
+print(estimator.hit_rate(holdout, holdout_responses))
+```
+
+## Сценарий: режим allocation
+
+Отличий от предыдущего сценария ровно два: чем заполнена колонка ответа и как
+измеряется качество.
+
+```python
+# План строится точно так же
+design = generator.generate()
+
+# Ответы: сумма баллов в каждой задаче одинакова
+responses = pd.read_csv("allocations.csv")   # колонка response: например 20/55/25
+
+estimator = CBCHierarchicalBayesEstimator(
+    attribute_cols=list(space),
+    interactions=[("Brand", "Price")],
+    response_mode="allocation",
+    include_none=True,
+    allocation_total=100,      # ожидаемая сумма; None — определить по первой задаче
+    allocation_weight=1.0,     # вес задачи в единицах одного выбора
+    draws=1500,
+    tune=1500,
+)
+estimator.fit(design, responses)
+
+# Для аллокаций содержательна точность долей, а не попадание в максимум
+print(estimator.share_metrics(holdout, holdout_responses))
+# {'mae': 0.099, 'rmse': 0.14, 'correlation': 0.887}
+```
+
+Про `allocation_weight` стоит прочитать раздел «Режим allocation: вес
+наблюдения» ниже: значение по умолчанию выбрано консервативно, и увеличивать его
+имеет смысл осознанно.
+
+Выдача устроена одинаково в обоих режимах — те же полезности, та же важность, те
+же таблицы взаимодействий. Различается только `RLH`: в `single_choice` это
+классическая метрика Sawtooth, в `allocation` — та же величина, взвешенная по
+долям баллов.
+
 ## Модуль 1: `CBCDesignGenerator`
 
 Строит рандомизированный сбалансированный план и возвращает длинный DataFrame с
